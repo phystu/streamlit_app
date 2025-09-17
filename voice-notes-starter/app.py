@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 
 load_dotenv()
-
+#
 st.set_page_config(page_title="병원 회의용 음성 자동 노트", page_icon="🩺", layout="centered")
 
 st.title("🩺 음성기반 자동 회의록/연구노트")
