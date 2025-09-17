@@ -1,4 +1,4 @@
-# utils/export.py  ← 전체 교체
+# export.py
 from typing import Dict, Any, Optional
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 import markdown as md
@@ -10,6 +10,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 import os
 import textwrap as _tw
+from pathlib import Path  # ← 추가
 
 __all__ = ["render_markdown", "save_markdown", "markdown_to_pdf"]
 
@@ -47,12 +48,20 @@ def _html_wrap(markdown_html: str) -> str:
 </html>"""
 # --------------------------------------------------
 
-def render_markdown(template_dir: str, template_name: str, context: Dict[str, Any]) -> str:
-    env = Environment(
-        loader=FileSystemLoader(template_dir),
-        autoescape=select_autoescape()
-    )
-    tpl = env.get_template(template_name)
+# ✅ 모듈 기준으로 templates 절대경로 고정
+ROOT_DIR = Path(__file__).resolve().parents[1]      # .../voice-notes-starter
+TEMPLATES_DIR = ROOT_DIR / "templates"
+
+_env = Environment(
+    loader=FileSystemLoader(str(TEMPLATES_DIR)),
+    autoescape=select_autoescape(["html", "xml", "md", "jinja", "j2"])
+)
+
+def render_markdown(template_name: str, context: Dict[str, Any]) -> str:
+    """
+    template_name: "meeting.md.j2" 또는 "research.md.j2"
+    """
+    tpl = _env.get_template(template_name)
     return tpl.render(**context)
 
 def save_markdown(md_text: str, out_path: str):
@@ -82,10 +91,9 @@ def _register_korean_font() -> Optional[str]:
 
 def markdown_to_pdf(md_text: str, out_pdf: str) -> str:
     """
-    1) wkhtmltopdf 있으면 HTML→PDFKit (UTF-8/한글 폰트 스타일 포함)
-    2) 실패 시 ReportLab 폴백: 시스템 한글 폰트 등록 후 텍스트 렌더링
+    1) wkhtmltopdf 있으면 HTML→PDFKit
+    2) 실패 시 ReportLab 폴백
     """
-    # 1) 고품질 경로
     try:
         html = md.markdown(md_text, extensions=["tables", "fenced_code", "nl2br"])
         html = _html_wrap(html)
@@ -93,7 +101,6 @@ def markdown_to_pdf(md_text: str, out_pdf: str) -> str:
         pdfkit.from_string(html, out_pdf, options=options)  # wkhtmltopdf 필요
         return out_pdf
     except Exception:
-        # 2) 폴백: ReportLab
         kfont = _register_korean_font() or "Helvetica"
         c = canvas.Canvas(out_pdf, pagesize=A4)
         width, height = A4
@@ -103,7 +110,7 @@ def markdown_to_pdf(md_text: str, out_pdf: str) -> str:
         except Exception:
             c.setFont("Helvetica", 11)
 
-        max_chars = 78  # 간이 줄바꿈
+        max_chars = 78
         for line in md_text.splitlines():
             wrapped = _tw.wrap(line, width=max_chars, replace_whitespace=False, drop_whitespace=False)
             if not wrapped:
