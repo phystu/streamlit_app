@@ -185,7 +185,7 @@ if uploaded is not None:
             template_name = "meeting.md.j2"
             out_base = "회의록_" + dt.datetime.now().strftime("%Y%m%d_%H%M")
 
-        md_text = render_markdown("templates", template_name, context)
+        md_text = render_markdown(template_name, context)
         md_path = f"{out_base}.md"
         pdf_path = f"{out_base}.pdf"
 
