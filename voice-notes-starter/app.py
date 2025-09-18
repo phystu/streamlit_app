@@ -10,6 +10,8 @@ from utils.export import render_markdown, save_markdown, markdown_to_pdf
 from pydub import AudioSegment
 from pydub.utils import which
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pydub.silence import detect_nonsilent
+
 
 load_dotenv()
 st.set_page_config(page_title="병원 회의용 음성 자동 노트", page_icon="🩺", layout="centered")
