@@ -11,7 +11,7 @@ from pydub import AudioSegment
 from pydub.utils import which
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pydub.silence import detect_nonsilent
-
+from collections import deque
 
 load_dotenv()
 st.set_page_config(page_title="병원 회의용 음성 자동 노트", page_icon="🩺", layout="centered")
@@ -147,41 +147,58 @@ def fast_transcribe_ko_with_progress(bytes_data: bytes, filename: str, api_key: 
 # ------------------------------
 def probe_transcribe_10s(bytes_data: bytes, filename: str, api_key: str | None) -> str:
     """
-    앞부분 '프로브 전사':
-    - 첫 비무음 구간부터 최소 3초 이상, 기본 10초
-    - 짧다는 에러가 오면 2배씩 최대 30초까지 확대 재시도
+    파일 전체를 스캔해서 RMS(음량)가 가장 큰 구간을 골라 프로브 전사.
+    - 기본 20초(window), 최소 3초, 최대 45초
     - 16kHz/mono/16bit PCM(WAV)로 안정화
+    - 'audio_too_short'가 나오면 창 크기를 늘려 자동 재시도
     """
+    # 1) 디코드 & 표준화
     aud = load_audio_from_bytes(bytes_data, filename).set_frame_rate(16_000).set_channels(1).set_sample_width(2)
     total_ms = len(aud)
     if total_ms < 150:  # 0.15s 이하면 무의미
         return ""
 
-    # 1) 첫 비무음 구간 찾기 (무음 시작 문제 회피)
-    try:
-        # 너무 타이트하지 않게: 평균보다 14dB 낮춤, 최소 -50dBFS
-        thresh = max(-50, (aud.dBFS if aud.dBFS != float("-inf") else -60) - 14)
-        regions = detect_nonsilent(aud, min_silence_len=150, silence_thresh=thresh)
-    except Exception:
-        regions = []
+    # 2) 가장 소리가 큰 구간 찾기 (RMS 기반 슬라이딩 윈도우)
+    def best_loud_window_ms(audio: AudioSegment, target_ms: int = 20_000, frame_ms: int = 50) -> tuple[int, int]:
+        tgt = min(max(3_000, target_ms), 45_000, len(audio))  # 3s ~ 45s, 파일 길이 내
+        step = frame_ms
+        w = max(1, tgt // step)
 
-    start = max(0, regions[0][0] - 250) if regions else 0  # 약간 앞을 포함
-    want_ms = 10_000
-    want_ms = min(total_ms - start, want_ms)
-    want_ms = max(want_ms, 3_000)  # 최소 3초
+        # 프레임 RMS 시퀀스
+        vals: list[int] = []
+        for s in range(0, len(audio), step):
+            seg = audio[s:s+step]
+            vals.append(seg.rms)
 
-    def _export_wav(s: int, e: int) -> bytes:
-        seg = aud[s:e]
+        # 슬라이딩 윈도우 합으로 최대값 구간 찾기 (deque)
+        best_sum = -1
+        best_start_frame = 0
+        q = deque()
+        cur_sum = 0
+        for i, v in enumerate(vals):
+            q.append(v); cur_sum += v
+            if len(q) > w:
+                cur_sum -= q.popleft()
+            if i >= w - 1 and cur_sum > best_sum:
+                best_sum = cur_sum
+                best_start_frame = i - (w - 1)
+
+        start_ms = best_start_frame * step
+        end_ms = min(len(audio), start_ms + tgt)
+        return start_ms, end_ms
+
+    s, e = best_loud_window_ms(aud, target_ms=20_000)  # 기본 20초
+
+    def _export_wav(s_ms: int, e_ms: int) -> bytes:
+        seg = aud[s_ms:e_ms]
         buf = io.BytesIO()
-        # pcm_s16le 보장
+        # pcm_s16le로 고정
         seg.export(buf, format="wav", parameters=["-acodec", "pcm_s16le"])
         return buf.getvalue()
 
-    s, e = start, min(total_ms, start + want_ms)
     wav_bytes = _export_wav(s, e)
 
-    # 2) 전사 시도 + 'too short' 자동 확대 재시도 (최대 30초)
-    attempts = 0
+    # 3) 전사 시도 + 'too short'면 10~45초 범위에서 자동 확대
     while True:
         try:
             txt = transcribe_audio(wav_bytes, "probe.wav", api_key=api_key, language_hint="ko")
@@ -189,16 +206,14 @@ def probe_transcribe_10s(bytes_data: bytes, filename: str, api_key: str | None) 
         except Exception as err:
             msg = str(err)
             too_short = ("audio_too_short" in msg) or ("too short" in msg) or ("'seconds': 0" in msg)
-            if too_short and (e - s) < 30_000:  # 30초까지 확대
-                new_len = max((e - s) * 2, 15_000)  # 최소 15초로 넓힘
-                new_len = min(new_len, 30_000, total_ms - s)
-                if new_len <= (e - s):  # 더 못 넓히면 중단
+            if too_short and (e - s) < 45_000:
+                new_len = min(45_000, (e - s) + 10_000, total_ms - s)  # +10s씩, 최대 45s
+                if new_len <= (e - s):
                     return ""
                 e = s + new_len
                 wav_bytes = _export_wav(s, e)
-                attempts += 1
                 continue
-            # 비무음이 전혀 없거나 다른 에러면 상위에서 경고 처리
+            # 다른 에러는 상위에서 경고 처리
             return ""
 
 
