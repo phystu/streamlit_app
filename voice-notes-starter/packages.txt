@@ -1,4 +1,0 @@
-ffmpeg
-wkhtmltopdf
-fonts-noto-cjk
-fonts-nanum
