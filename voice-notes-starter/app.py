@@ -1,13 +1,14 @@
 import streamlit as st
 from dotenv import load_dotenv
 import os, io, datetime as dt
-from utils.transcribe import transcribe_audio, get_audio_duration_seconds
+from utils.transcribe import transcribe_audio  # get_audio_duration_seconds는 미사용으로 변경
 from utils.summarize import summarize_transcript
 from utils.classify import decide_doc_type
 from utils.export import render_markdown, save_markdown, markdown_to_pdf
 
 # 추가: 고속 전사를 위한 라이브러리
 from pydub import AudioSegment
+from pydub.utils import which
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import math
 
@@ -18,18 +19,55 @@ st.set_page_config(page_title="병원 회의용 음성 자동 노트", page_icon
 st.title("🩺 음성기반 자동 회의록/연구노트")
 st.caption("업로드 → 전사 → 요약 → 서식 적용 → Markdown/PDF 저장")
 
+# -------------------------------------------------
+# 🔧 ffmpeg/ffprobe 보장 + BytesIO 안전 로더
+# -------------------------------------------------
+def ensure_ffmpeg() -> None:
+    """
+    pydub가 사용할 ffmpeg/ffprobe 경로를 확실히 세팅한다.
+    - PATH에서 못 찾으면 리눅스 기본 경로(/usr/bin/...)로도 시도
+    - 그래도 실패하면 Streamlit에 에러로 안내 후 stop
+    """
+    ffmpeg_path = which("ffmpeg") or "/usr/bin/ffmpeg"
+    ffprobe_path = which("ffprobe") or "/usr/bin/ffprobe"
+
+    if ffmpeg_path:
+        AudioSegment.converter = ffmpeg_path
+    if ffprobe_path:
+        AudioSegment.ffprobe = ffprobe_path
+
+    if not ffmpeg_path or not ffprobe_path:
+        try:
+            st.error("ffmpeg/ffprobe를 찾지 못했습니다. Streamlit Cloud 사용 시 루트에 `packages.txt`에 `ffmpeg` 한 줄 추가 후 재배포하세요.")
+            st.stop()
+        except Exception:
+            raise FileNotFoundError("ffmpeg/ffprobe not found on PATH")
+
+def load_audio_from_bytes(bytes_data: bytes, filename: str | None):
+    """
+    BytesIO로 읽을 때는 포맷을 명시해야 pydub가 안정적으로 동작.
+    """
+    ext = None
+    if filename and "." in filename:
+        ext = filename.rsplit(".", 1)[-1].lower()
+    return AudioSegment.from_file(io.BytesIO(bytes_data), format=ext)
+
 # ------------------------------
 # 고속 전사(병렬 청크) 헬퍼 함수
 # ------------------------------
-def fast_transcribe_ko_with_progress(bytes_data: bytes, filename: str, api_key: str | None, chunk_ms: int = 60_000, max_workers: int = 6) -> str:
+def fast_transcribe_ko_with_progress(bytes_data: bytes, filename: str, api_key: str | None,
+                                     chunk_ms: int = 60_000, max_workers: int = 6) -> str:
     """
     - 한국어 고정 전사
     - 16kHz 모노로 다운샘플 후 60초 단위 청크 분할
     - 각 청크를 32kbps mp3로 인메모리 인코딩해 API로 전송
     - 병렬 전사 + 진행률바 업데이트
     """
+    # 🔧 ffmpeg/ffprobe 보장
+    ensure_ffmpeg()
+
     # 1) 로드 & 다운샘플(속도 최적화)
-    audio = AudioSegment.from_file(io.BytesIO(bytes_data))
+    audio = load_audio_from_bytes(bytes_data, filename)  # 🔧 포맷 명시
     audio = audio.set_frame_rate(16_000).set_channels(1)
 
     # 2) 60초 청크 분할
@@ -88,7 +126,7 @@ with st.sidebar:
     api_key = st.text_input("OpenAI API Key (미입력 시 .env 사용)", type="password", value="")
     auto_detect = st.toggle("회의 타입 자동감지(일반/연구)", value=True)
 
-    # 🔒 한국어 전사 고정: 선택 UI 제거(원본 유지 원하면 주석 해제)
+    # 🔒 한국어 전사 고정: 선택 UI 제거(필요시 복원)
     # language_hint = st.selectbox("전사 언어 힌트", ["Auto", "ko", "en", "ja", "zh"], index=0)
 
     st.markdown("---")
@@ -117,14 +155,17 @@ meta = {
 st.divider()
 
 if uploaded is not None:
+    ensure_ffmpeg()  # 🔧 업로드 직후에도 보장
+
     ext = uploaded.name.split(".")[-1].lower()
     bytes_data = uploaded.getvalue()
 
-    # Duration check (max 2h for demo)
+    # Duration check (max 2h for demo) — ffprobe 없이 pydub 길이 계산
     try:
-        duration = get_audio_duration_seconds(bytes_data, ext)
-        st.write(f"오디오 길이: {duration/60:.1f}분")
-        if duration > 2 * 3600:
+        _aud = load_audio_from_bytes(bytes_data, uploaded.name)  # 🔧 포맷 명시
+        duration_sec = len(_aud) / 1000.0  # ms → sec
+        st.write(f"오디오 길이: {duration_sec/60:.1f}분")
+        if duration_sec > 2 * 3600:
             st.error("데모 제한: 2시간을 초과한 파일은 처리하지 않습니다.")
             st.stop()
     except Exception as e:
@@ -133,7 +174,6 @@ if uploaded is not None:
     if st.button("전사 → 요약 → 서식 적용 실행", type="primary"):
         # -------- 전사 단계 (한국어 고정 + 진행률바 + 고속전사) --------
         with st.spinner("전사 중…"):
-            # 기존 단일 호출 대신 병렬 청크 전사 사용
             transcript = fast_transcribe_ko_with_progress(
                 bytes_data=bytes_data,
                 filename=uploaded.name,
@@ -154,14 +194,14 @@ if uploaded is not None:
 
         # Build context for templates
         if doc_type == "research":
-            enrich = summary.get("research_enrich", {})
+            enrich = summary.get("research_enrich", {}) if isinstance(summary, dict) else {}
             context = {
                 "meta": meta,
                 "summary": {
-                    "brief": summary.get("brief",""),
-                    "bullets": summary.get("bullets",[]),
-                    "decisions": summary.get("decisions",[]),
-                    "actions": summary.get("actions",[]),
+                    "brief": (summary.get("brief","") if isinstance(summary, dict) else ""),
+                    "bullets": (summary.get("bullets",[]) if isinstance(summary, dict) else []),
+                    "decisions": (summary.get("decisions",[]) if isinstance(summary, dict) else []),
+                    "actions": (summary.get("actions",[]) if isinstance(summary, dict) else []),
                     "objective": enrich.get("objective",""),
                     "methods": enrich.get("methods",[]),
                     "results": enrich.get("results",[]),
@@ -175,10 +215,10 @@ if uploaded is not None:
             context = {
                 "meta": meta,
                 "summary": {
-                    "brief": summary.get("brief",""),
-                    "bullets": summary.get("bullets",[]),
-                    "decisions": summary.get("decisions",[]),
-                    "actions": summary.get("actions",[]),
+                    "brief": (summary.get("brief","") if isinstance(summary, dict) else ""),
+                    "bullets": (summary.get("bullets",[]) if isinstance(summary, dict) else []),
+                    "decisions": (summary.get("decisions",[]) if isinstance(summary, dict) else []),
+                    "actions": (summary.get("actions",[]) if isinstance(summary, dict) else []),
                 },
                 "transcript": transcript
             }
@@ -205,4 +245,4 @@ if uploaded is not None:
         st.markdown("미리보기(요약)")
         st.code(md_text[:1500] + ("..." if len(md_text)>1500 else ""), language="markdown")
 else:
-    st.info("오디오 파일을 업로드하면 처리를 시작할 수 있어요.")
+    st.info("좌측에서 오디오를 업로드하면 시작할 수 있어요.")
