@@ -1,6 +1,6 @@
 import streamlit as st
 from dotenv import load_dotenv
-import os, io, datetime as dt, shutil
+import os, io, datetime as dt, shutil, re, subprocess, json, tempfile
 from utils.transcribe import transcribe_audio
 from utils.summarize import summarize_transcript
 from utils.classify import decide_doc_type
@@ -20,126 +20,145 @@ st.caption("업로드 → 전사 → 요약 → 서식 적용 → Markdown/PDF �
 # 🔧 ffmpeg/ffprobe 보장 + 탐색 강화 + UI 리포트
 # -------------------------------------------------
 def _find_binary(name: str):
-    # 1) 환경변수 최우선 (사용자가 직접 지정 가능)
     env_key = "FFMPEG_BINARY" if name == "ffmpeg" else ("FFPROBE_BINARY" if name == "ffprobe" else None)
     if env_key and os.getenv(env_key):
         return os.getenv(env_key)
-
-    # 2) PATH에서 탐색
     path = which(name) or shutil.which(name)
     if path:
         return path
-
-    # 3) 자주 쓰는 시스템 경로 후보들
-    candidates = [
-        f"/usr/bin/{name}",
-        f"/usr/local/bin/{name}",
-        f"/bin/{name}",
-        f"/opt/homebrew/bin/{name}",  # (macOS 대비, Cloud에선 무의미하지만 안전)
-    ]
+    candidates = [f"/usr/bin/{name}", f"/usr/local/bin/{name}", f"/bin/{name}", f"/opt/homebrew/bin/{name}"]
     for c in candidates:
         if os.path.isfile(c) and os.access(c, os.X_OK):
             return c
-
     return None
 
 def ensure_ffmpeg() -> tuple[str, str]:
-    """
-    pydub가 사용할 ffmpeg/ffprobe 경로를 확실히 세팅하고 UI에 경로 출력.
-    못 찾으면 Streamlit에서 에러로 중단.
-    """
     ffmpeg_path  = _find_binary("ffmpeg")
     ffprobe_path = _find_binary("ffprobe")
-
     if ffmpeg_path:
         AudioSegment.converter = ffmpeg_path
     if ffprobe_path:
         AudioSegment.ffprobe = ffprobe_path
-
     if not ffmpeg_path or not ffprobe_path:
         msg = (
             "ffmpeg/ffprobe 실행파일을 찾지 못했습니다.\n\n"
             "• Streamlit Cloud라면 프로젝트 루트에 **packages.txt** 파일을 만들고 아래 두 줄을 넣은 뒤 재배포하세요:\n"
             "```\nffmpeg\nwkhtmltopdf\n```\n"
-            "• 재배포 후에도 문제면, Cloud 셸에서 `/usr/bin/ffprobe -version` 또는 `/usr/local/bin/ffprobe -version`이 출력되는지 확인하세요.\n"
-            "• (선택) 경로를 직접 지정하려면 환경변수 **FFMPEG_BINARY**, **FFPROBE_BINARY** 를 설정하세요."
+            "• (선택) 환경변수 **FFMPEG_BINARY**, **FFPROBE_BINARY** 로 절대경로 지정 가능."
         )
-        st.error(msg)
-        st.stop()
-
+        st.error(msg); st.stop()
     st.info(f"🔎 ffmpeg: `{ffmpeg_path}`\n\n🔎 ffprobe: `{ffprobe_path}`")
     return ffmpeg_path, ffprobe_path
 
 def load_audio_from_bytes(bytes_data: bytes, filename: str | None):
-    """
-    BytesIO로 읽을 때 포맷을 명시해야 안정적.
-    ffprobe가 없어도 여기까지 오기 전에 ensure_ffmpeg에서 막힘.
-    """
     ext = None
     if filename and "." in filename:
         ext = filename.rsplit(".", 1)[-1].lower()
     try:
         return AudioSegment.from_file(io.BytesIO(bytes_data), format=ext)
     except FileNotFoundError as e:
-        # pydub 내부에서 ffprobe 호출 실패 시 FileNotFoundError로 전파됨
-        raise FileNotFoundError(
-            "오디오 로딩 중 ffprobe를 실행하지 못했습니다. 상단의 ffmpeg/ffprobe 경로 안내를 확인하세요."
-        ) from e
+        raise FileNotFoundError("오디오 로딩 중 ffprobe 실행 실패. ffmpeg/ffprobe 경로를 확인하세요.") from e
+
+# ------------------------------
+# 길이 측정: ffprobe 우선, pydub 폴백
+# ------------------------------
+def _probe_duration_seconds_ffprobe(bytes_data: bytes, filename: str) -> float | None:
+    ffprobe_path = getattr(AudioSegment, "ffprobe", None)
+    if not ffprobe_path:
+        return None
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "bin"
+    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+        tmp.write(bytes_data); tmp_path = tmp.name
+    try:
+        cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", tmp_path]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        info = json.loads(out.decode("utf-8", errors="ignore"))
+        dur = info.get("format", {}).get("duration")
+        if dur is None: return None
+        val = float(dur)
+        return val if val > 0 else None
+    except Exception:
+        return None
+    finally:
+        try: os.remove(tmp_path)
+        except: pass
+
+def safe_get_duration_seconds(bytes_data: bytes, filename: str) -> float | None:
+    val = _probe_duration_seconds_ffprobe(bytes_data, filename)
+    if val and val > 0:
+        return val
+    try:
+        aud = load_audio_from_bytes(bytes_data, filename)
+        sec = len(aud) / 1000.0
+        return sec if sec > 0 else None
+    except Exception:
+        return None
 
 # ------------------------------
 # 고속 전사(병렬 청크) 헬퍼 함수
 # ------------------------------
 def fast_transcribe_ko_with_progress(bytes_data: bytes, filename: str, api_key: str | None,
                                      chunk_ms: int = 60_000, max_workers: int = 6) -> str:
-    # 🔧 ffmpeg/ffprobe 보장 + 경로 리포트
     ensure_ffmpeg()
-
-    # 1) 로드 & 다운샘플
-    audio = load_audio_from_bytes(bytes_data, filename)
-    audio = audio.set_frame_rate(16_000).set_channels(1)
-
-    # 2) 청크 분할
+    audio = load_audio_from_bytes(bytes_data, filename).set_frame_rate(16_000).set_channels(1)
     total_ms = len(audio)
-    chunks = []
-    for i, start in enumerate(range(0, total_ms, chunk_ms)):
-        seg = audio[start: start + chunk_ms]
-        chunks.append((i, seg))
-
+    chunks = [(i, audio[start:start+chunk_ms]) for i, start in enumerate(range(0, total_ms, chunk_ms))]
     total = len(chunks)
     if total == 0:
         return ""
+    progress = st.progress(0); status = st.empty()
+    done = 0; failed = 0
 
-    # 3) 진행률 UI
-    progress = st.progress(0)
-    status = st.empty()
-    done = 0
-
-    # 4) per-chunk 전사 함수
     def transcribe_one(idx_seg):
         idx, seg = idx_seg
-        buf = io.BytesIO()
-        seg.export(buf, format="mp3", bitrate="32k")  # 업로드 시간 단축
-        data = buf.getvalue()
-        out = transcribe_audio(data, f"{idx}_{filename}.mp3", api_key=(api_key or None), language_hint="ko")
-        text = out if isinstance(out, str) else (out.get("text", "") if isinstance(out, dict) else str(out))
-        return idx, text
+        try:
+            buf = io.BytesIO()
+            seg.export(buf, format="mp3", bitrate="32k")
+            data = buf.getvalue()
+            out = transcribe_audio(data, f"{idx}_{filename}.mp3", api_key=(api_key or None), language_hint="ko")
+            text = out if isinstance(out, str) else (out.get("text", "") if isinstance(out, dict) else str(out))
+            return idx, (text or "").strip()
+        except Exception:
+            return idx, ""
 
-    # 5) 병렬 실행
     texts = [None] * total
-    workers = min(max_workers, total)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with ThreadPoolExecutor(max_workers=min(max_workers, total)) as ex:
         futures = [ex.submit(transcribe_one, ch) for ch in chunks]
         for fut in as_completed(futures):
             idx, text = fut.result()
             texts[idx] = text
+            if not text: failed += 1
             done += 1
             pct = int(done / total * 100)
             progress.progress(pct)
             status.write(f"전사 진행률: {done}/{total} 청크 완료 ({pct}%)")
+    progress.empty(); status.empty()
+    if failed:
+        st.warning(f"일부 청크 전사 실패: {failed}/{total}")
+    full_text = "\n".join(t for t in texts if t)
+    if len(full_text.strip()) < 30:
+        raise RuntimeError("전사 결과가 비정상적으로 짧습니다. 파일/코덱/네트워크/키를 확인하세요.")
+    return full_text
 
-    progress.empty()
-    status.empty()
-    return " ".join(t for t in texts if t)
+# ------------------------------
+# 프로브 전사(앞 10초) + 유사도 검증
+# ------------------------------
+def probe_transcribe_10s(bytes_data: bytes, filename: str, api_key: str | None) -> str:
+    aud = load_audio_from_bytes(bytes_data, filename).set_frame_rate(16_000).set_channels(1)
+    seg = aud[:10_000]
+    buf = io.BytesIO(); seg.export(buf, format="wav")
+    wav_bytes = buf.getvalue()
+    txt = transcribe_audio(wav_bytes, "probe.wav", api_key=api_key, language_hint="ko")
+    return (txt or "").strip()
+
+def _tokens(s: str) -> set:
+    return set(re.findall(r"[가-힣A-Za-z0-9]{2,}", s))
+
+def similar_enough(short_txt: str, long_txt: str, min_overlap_ratio: float = 0.15) -> bool:
+    A, B = _tokens(short_txt.lower()), _tokens(long_txt.lower())
+    if not A or not B: return False
+    overlap = len(A & B) / max(len(A), 1)
+    return overlap >= min_overlap_ratio
 
 # ------------------------------
 # UI
@@ -176,51 +195,106 @@ meta = {
 
 st.divider()
 
-if uploaded is not None:
-    # 업로드 직후 바이너리 경로 확인 및 보고
-    ensure_ffmpeg()
+# 세션 상태: 업로드 변경 시 초기화
+if 'last_upload_name' not in st.session_state:
+    st.session_state.last_upload_name = None
+if uploaded is not None and uploaded.name != st.session_state.last_upload_name:
+    st.session_state.last_upload_name = uploaded.name
+    for k in ("transcript", "summary", "doc_type"):
+        st.session_state.pop(k, None)
 
+if uploaded is not None:
+    ensure_ffmpeg()
+    ext = uploaded.name.split(".")[-1].lower()
     bytes_data = uploaded.getvalue()
 
-    # ffprobe 없이 pydub 길이 계산 (내부 디코드 길이 사용)
+    if not bytes_data or len(bytes_data) < 1024:
+        st.error("업로드한 파일이 비어 있거나 너무 작습니다. 파일을 다시 업로드해 주세요.")
+        st.stop()
+
+    # 미리듣기(진짜 파일인지 육안 확인)
+    st.audio(bytes_data, format=f"audio/{ext}")
+
+    # 길이 표시(정확)
+    duration_sec = None
     try:
-        _aud = load_audio_from_bytes(bytes_data, uploaded.name)
-        duration_sec = len(_aud) / 1000.0
+        duration_sec = safe_get_duration_seconds(bytes_data, uploaded.name)
+    except Exception as e:
+        st.warning(f"길이 확인 중 예외: {e}")
+    if duration_sec is None or duration_sec <= 0:
+        st.warning("오디오 길이 확인 실패(계속 진행 가능). 파일 코덱/컨테이너 문제일 수 있어요.")
+    else:
         st.write(f"오디오 길이: {duration_sec/60:.1f}분")
         if duration_sec > 2 * 3600:
             st.error("데모 제한: 2시간을 초과한 파일은 처리하지 않습니다.")
             st.stop()
-    except Exception as e:
-        st.warning(f"길이 확인 실패(계속 진행 가능): {e}")
 
+    # 프로브 전사(앞 10초)
+    probe_text = ""
+    try:
+        probe_text = probe_transcribe_10s(bytes_data, uploaded.name, api_key or None)
+        st.markdown("**전사 프로브(앞 10초) 미리보기**")
+        st.code(probe_text[:300] + ("..." if len(probe_text) > 300 else ""))
+        if len(probe_text) < 5:
+            st.warning("앞 10초 전사가 거의 비어 있습니다. 파일의 실제 내용/코덱을 확인하세요.")
+    except Exception as e:
+        st.warning(f"프로브 전사 실패(계속 가능): {e}")
+
+    # 실행
     if st.button("전사 → 요약 → 서식 적용 실행", type="primary"):
         with st.spinner("전사 중…"):
-            transcript = fast_transcribe_ko_with_progress(
-                bytes_data=bytes_data,
-                filename=uploaded.name,
-                api_key=(api_key or None),
-                chunk_ms=60_000,
-                max_workers=6
-            )
+            try:
+                transcript = fast_transcribe_ko_with_progress(
+                    bytes_data=bytes_data,
+                    filename=uploaded.name,
+                    api_key=(api_key or None),
+                    chunk_ms=60_000,
+                    max_workers=6
+                )
+            except Exception as e:
+                st.error(f"전사 실패: {e}")
+                st.stop()
+
+        # 품질 가드
+        if not transcript or len(transcript.strip()) < 30:
+            st.error("전사 결과가 비어 있거나 너무 짧습니다. 파일/코덱/네트워크 문제를 확인하세요.")
+            st.stop()
+        try:
+            if probe_text and not similar_enough(probe_text, transcript):
+                st.error("전사 결과가 오디오(앞 10초) 내용과 충분히 유사하지 않습니다. "
+                         "파일이 잘못 업로드되었거나 코덱/형식 문제일 수 있습니다.")
+                st.stop()
+        except Exception:
+            st.warning("전사 유사도 검증을 수행하지 못했습니다. 계속 진행합니다.")
+
+        st.session_state.transcript = transcript
 
         with st.spinner("요약/분류 중…"):
             summary = summarize_transcript(transcript, api_key=(api_key or None))
+            if isinstance(summary, str):
+                summary = {"brief": summary, "bullets": [], "decisions": [], "actions": []}
             doc_type = decide_doc_type(summary)
+            st.session_state.summary = summary
+            st.session_state.doc_type = doc_type
+
+        st.markdown("**전사 미리보기 (앞 400자)**")
+        st.code(transcript[:400] + ("..." if len(transcript) > 400 else ""))
+
+        st.success(f"문서 유형: {'연구노트' if doc_type=='research' else '일반 회의록'}")
 
         if not auto_detect:
             doc_type = st.radio("문서 유형 선택", options=["general","research"], index=0, horizontal=True)
 
-        st.success(f"문서 유형: {'연구노트' if doc_type=='research' else '일반 회의록'}")
-
+        # 템플릿 컨텍스트
         if doc_type == "research":
             enrich = summary.get("research_enrich", {}) if isinstance(summary, dict) else {}
             context = {
                 "meta": meta,
                 "summary": {
-                    "brief": (summary.get("brief","") if isinstance(summary, dict) else ""),
-                    "bullets": (summary.get("bullets",[]) if isinstance(summary, dict) else []),
-                    "decisions": (summary.get("decisions",[]) if isinstance(summary, dict) else []),
-                    "actions": (summary.get("actions",[]) if isinstance(summary, dict) else []),
+                    "brief": summary.get("brief",""),
+                    "bullets": summary.get("bullets",[]),
+                    "decisions": summary.get("decisions",[]),
+                    "actions": summary.get("actions",[]),
                     "objective": enrich.get("objective",""),
                     "methods": enrich.get("methods",[]),
                     "results": enrich.get("results",[]),
@@ -234,10 +308,10 @@ if uploaded is not None:
             context = {
                 "meta": meta,
                 "summary": {
-                    "brief": (summary.get("brief","") if isinstance(summary, dict) else ""),
-                    "bullets": (summary.get("bullets",[]) if isinstance(summary, dict) else []),
-                    "decisions": (summary.get("decisions",[]) if isinstance(summary, dict) else []),
-                    "actions": (summary.get("actions",[]) if isinstance(summary, dict) else []),
+                    "brief": summary.get("brief",""),
+                    "bullets": summary.get("bullets",[]),
+                    "decisions": summary.get("decisions",[]),
+                    "actions": summary.get("actions",[]),
                 },
                 "transcript": transcript
             }
@@ -245,8 +319,7 @@ if uploaded is not None:
             out_base = "회의록_" + dt.datetime.now().strftime("%Y%m%d_%H%M")
 
         md_text = render_markdown("templates", template_name, context)
-        md_path = f"{out_base}.md"
-        pdf_path = f"{out_base}.pdf"
+        md_path = f"{out_base}.md"; pdf_path = f"{out_base}.pdf"
 
         save_markdown(md_text, md_path)
         try:
@@ -262,6 +335,6 @@ if uploaded is not None:
                 st.download_button("📥 Markdown만 다운로드", data=f, file_name=md_path, mime="text/markdown")
 
         st.markdown("미리보기(요약)")
-        st.code(md_text[:1500] + ("..." if len(md_text)>1500 else ""), language="markdown")
+        st.code(md_text[:1500] + ("..." if len(md_text) > 1500 else ""), language="markdown")
 else:
     st.info("좌측에서 오디오를 업로드하면 시작할 수 있어요.")
