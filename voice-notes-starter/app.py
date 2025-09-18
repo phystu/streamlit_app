@@ -144,12 +144,61 @@ def fast_transcribe_ko_with_progress(bytes_data: bytes, filename: str, api_key: 
 # 프로브 전사(앞 10초) + 유사도 검증
 # ------------------------------
 def probe_transcribe_10s(bytes_data: bytes, filename: str, api_key: str | None) -> str:
-    aud = load_audio_from_bytes(bytes_data, filename).set_frame_rate(16_000).set_channels(1)
-    seg = aud[:10_000]
-    buf = io.BytesIO(); seg.export(buf, format="wav")
-    wav_bytes = buf.getvalue()
-    txt = transcribe_audio(wav_bytes, "probe.wav", api_key=api_key, language_hint="ko")
-    return (txt or "").strip()
+    """
+    앞부분 '프로브 전사':
+    - 첫 비무음 구간부터 최소 3초 이상, 기본 10초
+    - 짧다는 에러가 오면 2배씩 최대 30초까지 확대 재시도
+    - 16kHz/mono/16bit PCM(WAV)로 안정화
+    """
+    aud = load_audio_from_bytes(bytes_data, filename).set_frame_rate(16_000).set_channels(1).set_sample_width(2)
+    total_ms = len(aud)
+    if total_ms < 150:  # 0.15s 이하면 무의미
+        return ""
+
+    # 1) 첫 비무음 구간 찾기 (무음 시작 문제 회피)
+    try:
+        # 너무 타이트하지 않게: 평균보다 14dB 낮춤, 최소 -50dBFS
+        thresh = max(-50, (aud.dBFS if aud.dBFS != float("-inf") else -60) - 14)
+        regions = detect_nonsilent(aud, min_silence_len=150, silence_thresh=thresh)
+    except Exception:
+        regions = []
+
+    start = max(0, regions[0][0] - 250) if regions else 0  # 약간 앞을 포함
+    want_ms = 10_000
+    want_ms = min(total_ms - start, want_ms)
+    want_ms = max(want_ms, 3_000)  # 최소 3초
+
+    def _export_wav(s: int, e: int) -> bytes:
+        seg = aud[s:e]
+        buf = io.BytesIO()
+        # pcm_s16le 보장
+        seg.export(buf, format="wav", parameters=["-acodec", "pcm_s16le"])
+        return buf.getvalue()
+
+    s, e = start, min(total_ms, start + want_ms)
+    wav_bytes = _export_wav(s, e)
+
+    # 2) 전사 시도 + 'too short' 자동 확대 재시도 (최대 30초)
+    attempts = 0
+    while True:
+        try:
+            txt = transcribe_audio(wav_bytes, "probe.wav", api_key=api_key, language_hint="ko")
+            return (txt or "").strip()
+        except Exception as err:
+            msg = str(err)
+            too_short = ("audio_too_short" in msg) or ("too short" in msg) or ("'seconds': 0" in msg)
+            if too_short and (e - s) < 30_000:  # 30초까지 확대
+                new_len = max((e - s) * 2, 15_000)  # 최소 15초로 넓힘
+                new_len = min(new_len, 30_000, total_ms - s)
+                if new_len <= (e - s):  # 더 못 넓히면 중단
+                    return ""
+                e = s + new_len
+                wav_bytes = _export_wav(s, e)
+                attempts += 1
+                continue
+            # 비무음이 전혀 없거나 다른 에러면 상위에서 경고 처리
+            return ""
+
 
 def _tokens(s: str) -> set:
     return set(re.findall(r"[가-힣A-Za-z0-9]{2,}", s))
