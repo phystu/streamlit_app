@@ -7,7 +7,6 @@ import os
 import io
 import shutil
 import tempfile
-import subprocess
 from typing import Optional, List
 
 # --- Jinja2 (템플릿) ---
@@ -82,14 +81,39 @@ def _template_dirs(hint: str | Path | None = None) -> List[str]:
     return out
 
 
-def _ensure_utf8_no_bom(text: str) -> bytes:
+def _ensure_utf8_no_bom(text: str | bytes) -> bytes:
     """
-    안전한 UTF-8(쉼표 없음) 바이트로 변환.
+    안전한 UTF-8 바이트로 변환(BOM 없음).
     """
     if isinstance(text, bytes):
-        # 이미 bytes면 그대로 사용하되, UTF-8로 재해석 시도는 하지 않음
         return text
     return text.encode("utf-8", "replace")
+
+
+def _find_korean_font_path() -> Optional[Path]:
+    """
+    레포 동봉 폰트 및 시스템 폰트를 순차 탐색.
+    사용자가 제공한 H2GTRM.TTF를 최우선으로 시도.
+    """
+    utils_dir = Path(__file__).resolve().parent
+    repo_root = utils_dir.parent
+
+    bundled_fonts = [
+        repo_root / "fonts" / "H2GTRM.TTF",           # 사용자가 넣어둔 폰트(최우선)
+        repo_root / "fonts" / "NanumGothic.ttf",
+        repo_root / "fonts" / "NotoSansCJK-Regular.ttf",
+        repo_root / "fonts" / "NotoSansKR-Regular.otf",
+    ]
+    system_fonts = [
+        Path("/usr/share/fonts/truetype/nanum/NanumGothic.ttf"),
+        Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+        Path("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf"),
+    ]
+
+    for p in bundled_fonts + system_fonts:
+        if p.exists():
+            return p
+    return None
 
 
 # --------------------------------------------------------------------------------------
@@ -139,10 +163,10 @@ def save_markdown(md_text: str, out_dir: str | Path, filename: str = "document.m
 
 def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_title: str = "Document") -> Path:
     """
-    Markdown → PDF 변환.
-    - 1순위: pdfkit + wkhtmltopdf(설치되어 있을 때)
-    - 2순위: ReportLab(간단한 문단 렌더링)
-    - 최후: 아주 단순한 txt → PDF (ReportLab 캔버스)
+    Markdown → PDF 변환 (한글 폰트 임베드 대응)
+    - 1순위: pdfkit + wkhtmltopdf (CSS @font-face + enable-local-file-access)
+    - 2순위: ReportLab (TTFont 등록 후 문단 렌더)
+    - 최후: canvas 폴백
     """
     # 출력 경로 준비
     if out_pdf_path is None:
@@ -151,33 +175,88 @@ def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_t
     out_pdf_path = Path(out_pdf_path)
     out_pdf_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # HTML 변환(가능하면)
-    html_str: Optional[str] = None
+    # 0) 폰트 경로 탐색
+    font_path = _find_korean_font_path()
+    font_family_name = "DocKorean"  # CSS/ReportLab에서 사용할 논리 이름
+
+    # 1) Markdown → HTML
     if mdlib is not None:
         try:
-            html_str = mdlib.markdown(md_text or "", extensions=["extra", "tables", "sane_lists"])
+            html_body = mdlib.markdown(md_text or "", extensions=["extra", "tables", "sane_lists"])
         except Exception:
-            # markdown 실패 시 html_str=None 으로 두고 폴백
-            html_str = None
-    if html_str is None:
-        # 마크다운 라이브러리가 없으면 최소한의 프리포맷 HTML로 감싸기
+            from html import escape
+            html_body = f"<pre>{escape(md_text or '')}</pre>"
+    else:
         from html import escape
-        html_str = f"<html><head><meta charset='utf-8'><title>{escape(html_title)}</title></head><body><pre>{escape(md_text or '')}</pre></body></html>"
+        html_body = f"<pre>{escape(md_text or '')}</pre>"
 
-    # 1) pdfkit + wkhtmltopdf 시도
+    # 2) CSS 구성 (폰트 임베드)
+    base_css = [
+        "html,body{margin:24px;font-size:14px;line-height:1.6;}",
+        "table{border-collapse:collapse;} td,th{border:1px solid #888;padding:6px;}",
+        "code,pre{font-family:monospace;}",
+    ]
+    font_css = ""
+    if font_path:
+        # wkhtmltopdf가 로컬 파일을 읽어올 수 있도록 file:// 스킴 사용
+        font_url = "file://" + str(font_path.resolve()).replace("\\", "/")
+        # 대부분 TTF는 'truetype' 포맷으로 인식
+        font_css = f"""
+        @font-face {{
+          font-family: '{font_family_name}';
+          src: url('{font_url}') format('truetype');
+          font-weight: normal;
+          font-style: normal;
+        }}
+        body, p, li, td, th, h1, h2, h3, h4, h5, h6 {{
+          font-family: '{font_family_name}', 'DejaVu Sans', Arial, sans-serif;
+        }}
+        """
+    else:
+        base_css.append("body{font-family:'DejaVu Sans', Arial, sans-serif;}")
+
+    html_str = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>{html_title}</title>
+<style>
+{font_css}
+{'\n'.join(base_css)}
+</style>
+</head>
+<body>
+{html_body}
+</body>
+</html>
+"""
+
+    # 3) pdfkit + wkhtmltopdf (권장 경로)
     if pdfkit is not None:
         try:
-            # wkhtmltopdf 바이너리 확인(환경변수나 PATH에 있어야 함)
             config = None
             wkhtml = os.environ.get("WKHTMLTOPDF_BINARY")
             if wkhtml and Path(wkhtml).exists():
-                config = pdfkit.configuration(wkhtmltopdf=wkhtml)  # 명시 설정
-            # 임시 HTML 파일 생성 후 변환
+                config = pdfkit.configuration(wkhtmltopdf=wkhtml)
+
             with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
                 f.write(html_str)
                 html_path = f.name
+
+            options = {
+                # 한글 폰트/이미지 등 로컬 리소스 접근 허용 (매우 중요)
+                "enable-local-file-access": None,
+                "encoding": "UTF-8",
+                # 페이지 옵션
+                "margin-top": "10mm",
+                "margin-bottom": "12mm",
+                "margin-left": "10mm",
+                "margin-right": "10mm",
+                "page-size": "A4",
+            }
+
             try:
-                pdfkit.from_file(html_path, str(out_pdf_path), configuration=config)
+                pdfkit.from_file(html_path, str(out_pdf_path), configuration=config, options=options)
                 return out_pdf_path
             finally:
                 try:
@@ -185,80 +264,77 @@ def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_t
                 except Exception:
                     pass
         except Exception:
-            # 다음 폴백으로 진행
+            # 다음 폴백
             pass
 
-    # 2) ReportLab (문단 기반)
+    # 4) ReportLab 경로 (폰트 등록 후 문단 렌더)
     if reportlab_available:
         try:
             styles = getSampleStyleSheet()
             style = styles["BodyText"]
 
-            # 한글 폰트가 필요하면(옵션): 환경에 TTF가 있다면 등록
-            # 예) NotoSansCJK-Regular.ttc / NanumGothic.ttf 경로가 있다면 등록해서 스타일에 적용 가능
-            # 아래는 자동 탐색(성공하면 적용)
-            def _try_register_korean_font():
-                candidates = [
-                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
-                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttf",
-                    str(Path.home() / "fonts" / "NanumGothic.ttf"),
-                ]
-                for c in candidates:
-                    p = Path(c)
-                    if p.exists():
-                        try:
-                            pdfmetrics.registerFont(TTFont("KOREAN", str(p)))
-                            return "KOREAN"
-                        except Exception:
-                            continue
-                return None
-
-            kfont = _try_register_korean_font()
-            if kfont:
-                style.fontName = kfont
+            if font_path and font_path.exists():
+                try:
+                    pdfmetrics.registerFont(TTFont(font_family_name, str(font_path)))
+                    style.fontName = font_family_name
+                except Exception:
+                    # 등록 실패 시 기본값 유지
+                    pass
 
             doc = SimpleDocTemplate(str(out_pdf_path), pagesize=A4, title=html_title)
             story = []
             for para in (md_text or "").split("\n\n"):
-                # 매우 단순한 문단 나눔(***고급 마크다운 렌더링 아님***)
                 story.append(Paragraph(para.replace("\n", "<br/>"), style))
                 story.append(Spacer(1, 4 * mm))
             doc.build(story)
             return out_pdf_path
         except Exception:
-            # 아래 최후 폴백으로 진행
+            # 최후 폴백
             pass
 
-    # 3) 최후 폴백: ReportLab 캔버스로 프리텍스트 느낌으로 저장(아주 단순)
+    # 5) 최후 폴백: 아주 단순한 canvas 출력 (한글 폰트 등록 시에만 권장)
     try:
-        from reportlab.pdfgen import canvas  # 경량 import
+        from reportlab.pdfgen import canvas
         from reportlab.lib.pagesizes import A4
 
         c = canvas.Canvas(str(out_pdf_path), pagesize=A4)
         width, height = A4
-
         x_margin = 20 * mm
         y = height - 20 * mm
         line_height = 5 * mm
 
-        # 기본 폰트(영문 위주). 한글은 폰트 등록이 필요하므로 위 2) 경로를 권장.
-        c.setFont("Helvetica", 10)
+        # 폰트 등록 (가능하면)
+        if reportlab_available and font_path and font_path.exists():
+            try:
+                pdfmetrics.registerFont(TTFont(font_family_name, str(font_path)))
+                c.setFont(font_family_name, 10)
+            except Exception:
+                c.setFont("Helvetica", 10)  # 한글 미지원
+        else:
+            c.setFont("Helvetica", 10)      # 한글 미지원
 
         for line in (md_text or "").splitlines():
             if y < 20 * mm:
                 c.showPage()
-                c.setFont("Helvetica", 10)
+                try:
+                    c.setFont(font_family_name, 10)
+                except Exception:
+                    c.setFont("Helvetica", 10)
                 y = height - 20 * mm
-            # 너무 긴 줄은 잘라서 표시(간단 처리)
-            while len(line) > 100:
-                c.drawString(x_margin, y, line[:100])
-                line = line[100:]
+
+            # 너무 긴 줄은 단순 분할
+            while len(line) > 90:
+                c.drawString(x_margin, y, line[:90])
+                line = line[90:]
                 y -= line_height
                 if y < 20 * mm:
                     c.showPage()
-                    c.setFont("Helvetica", 10)
+                    try:
+                        c.setFont(font_family_name, 10)
+                    except Exception:
+                        c.setFont("Helvetica", 10)
                     y = height - 20 * mm
+
             c.drawString(x_margin, y, line)
             y -= line_height
 
@@ -266,5 +342,5 @@ def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_t
         return out_pdf_path
     except Exception as e:
         raise RuntimeError(
-            "Markdown을 PDF로 변환하지 못했습니다. pdfkit(wkhtmltopdf) 또는 reportlab 설치를 권장합니다."
+            "Markdown을 PDF로 변환하지 못했습니다. wkhtmltopdf 또는 reportlab 설치/폰트 동봉을 권장합니다."
         ) from e
