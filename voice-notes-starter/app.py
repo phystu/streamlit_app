@@ -97,7 +97,7 @@ with st.sidebar:
 st.subheader("1) 오디오 업로드")
 uploaded = st.file_uploader("오디오 파일 (mp3, m4a, wav, ogg, webm 등)", type=["flac","m4a","mp3","mp4","mpeg","mpga","oga","ogg","wav","webm"])
 
-st.subheader("2) 메타데이터")
+st.subheader("2) 기본데이터")
 col1, col2 = st.columns(2)
 with col1:
     mt_title = st.text_input("제목", "의생명연구원 정기회의")
