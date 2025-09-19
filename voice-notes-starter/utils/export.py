@@ -4,10 +4,8 @@ from __future__ import annotations
 # --- 표준 라이브러리 ---
 from pathlib import Path
 import os
-import io
-import shutil
 import tempfile
-from typing import Optional, List
+from typing import Optional, List, Union
 
 # --- Jinja2 (템플릿) ---
 from jinja2 import Environment, FileSystemLoader, select_autoescape, TemplateNotFound
@@ -40,7 +38,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # 내부 유틸
 # --------------------------------------------------------------------------------------
-def _template_dirs(hint: str | Path | None = None) -> List[str]:
+def _template_dirs(hint: Optional[Union[str, Path]] = None) -> List[str]:
     """
     Streamlit Cloud/로컬 어디서 실행하든 템플릿 폴더를 안정적으로 찾기 위한 후보 경로들.
     존재하는 디렉터리만 문자열 경로로 반환(중복 제거).
@@ -48,7 +46,7 @@ def _template_dirs(hint: str | Path | None = None) -> List[str]:
     here = Path(__file__).resolve().parent          # .../utils
     repo = here.parent                               # 프로젝트 루트 가정
 
-    cands: List[Path] = []
+    cands = []  # type: List[Path]
     if hint:
         p = Path(hint)
         cands += [p, here / p, repo / p]
@@ -66,8 +64,8 @@ def _template_dirs(hint: str | Path | None = None) -> List[str]:
         Path("/mount/src/app/templates"),
     ]
 
-    seen: set[str] = set()
-    out: List[str] = []
+    seen = set()     # type: set
+    out = []         # type: List[str]
     for d in cands:
         try:
             r = d.resolve()
@@ -81,7 +79,7 @@ def _template_dirs(hint: str | Path | None = None) -> List[str]:
     return out
 
 
-def _ensure_utf8_no_bom(text: str | bytes) -> bytes:
+def _ensure_utf8_no_bom(text):  # type: (Union[str, bytes]) -> bytes
     """
     안전한 UTF-8 바이트로 변환(BOM 없음).
     """
@@ -119,7 +117,9 @@ def _find_korean_font_path() -> Optional[Path]:
 # --------------------------------------------------------------------------------------
 # 공개 API
 # --------------------------------------------------------------------------------------
-def render_markdown(templates_dir: str | Path | None, template_name: str, context: dict) -> str:
+def render_markdown(templates_dir: Optional[Union[str, Path]],
+                    template_name: str,
+                    context: dict) -> str:
     """
     Jinja2 템플릿을 로드하여 Markdown 문자열로 렌더링.
     templates_dir는 'templates' 같은 힌트일 뿐이며, 실제로는 여러 후보 경로를 탐색.
@@ -142,15 +142,15 @@ def render_markdown(templates_dir: str | Path | None, template_name: str, contex
             existing += [p.name for p in Path(d).glob("*")]
         existing = sorted(set(existing))
         raise FileNotFoundError(
-            f"TemplateNotFound: '{template_name}'. "
-            f"탐색 경로: {dirs} | 발견된 파일: {existing}"
+            "TemplateNotFound: '{}'.".format(template_name) +
+            " 탐색 경로: {} | 발견된 파일: {}".format(dirs, existing)
         ) from e
 
     text = tpl.render(**(context or {}))
     return text if isinstance(text, str) else text.decode("utf-8", "replace")
 
 
-def save_markdown(md_text: str, out_dir: str | Path, filename: str = "document.md") -> Path:
+def save_markdown(md_text: str, out_dir: Union[str, Path], filename: str = "document.md") -> Path:
     """
     Markdown 텍스트를 UTF-8로 저장하고, 저장된 경로를 반환.
     """
@@ -161,7 +161,9 @@ def save_markdown(md_text: str, out_dir: str | Path, filename: str = "document.m
     return out_path
 
 
-def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_title: str = "Document") -> Path:
+def markdown_to_pdf(md_text: str,
+                    out_pdf_path: Optional[Union[str, Path]] = None,
+                    html_title: str = "Document") -> Path:
     """
     Markdown → PDF 변환 (한글 폰트 임베드 대응)
     - 1순위: pdfkit + wkhtmltopdf (CSS @font-face + enable-local-file-access)
@@ -185,10 +187,10 @@ def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_t
             html_body = mdlib.markdown(md_text or "", extensions=["extra", "tables", "sane_lists"])
         except Exception:
             from html import escape
-            html_body = f"<pre>{escape(md_text or '')}</pre>"
+            html_body = "<pre>{}</pre>".format(escape(md_text or ""))
     else:
         from html import escape
-        html_body = f"<pre>{escape(md_text or '')}</pre>"
+        html_body = "<pre>{}</pre>".format(escape(md_text or ""))
 
     # 2) CSS 구성 (폰트 임베드)
     base_css = [
@@ -200,36 +202,22 @@ def markdown_to_pdf(md_text: str, out_pdf_path: str | Path | None = None, html_t
     if font_path:
         # wkhtmltopdf가 로컬 파일을 읽어올 수 있도록 file:// 스킴 사용
         font_url = "file://" + str(font_path.resolve()).replace("\\", "/")
-        # 대부분 TTF는 'truetype' 포맷으로 인식
-        font_css = f"""
-        @font-face {{
-          font-family: '{font_family_name}';
-          src: url('{font_url}') format('truetype');
-          font-weight: normal;
-          font-style: normal;
-        }}
-        body, p, li, td, th, h1, h2, h3, h4, h5, h6 {{
-          font-family: '{font_family_name}', 'DejaVu Sans', Arial, sans-serif;
-        }}
-        """
+        font_css = (
+            "@font-face{font-family:'" + font_family_name + "';"
+            "src:url('" + font_url + "') format('truetype');"
+            "font-weight:normal;font-style:normal;}"
+            "body,p,li,td,th,h1,h2,h3,h4,h5,h6{font-family:'" + font_family_name + "','DejaVu Sans',Arial,sans-serif;}"
+        )
     else:
         base_css.append("body{font-family:'DejaVu Sans', Arial, sans-serif;}")
 
-    html_str = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>{html_title}</title>
-<style>
-{font_css}
-{'\n'.join(base_css)}
-</style>
-</head>
-<body>
-{html_body}
-</body>
-</html>
-"""
+    html_str = (
+        "<!doctype html>"
+        "<html><head><meta charset='utf-8'/>"
+        "<title>{}</title>"
+        "<style>{}\n{}</style>"
+        "</head><body>{}</body></html>"
+    ).format(html_title, font_css, "\n".join(base_css), html_body)
 
     # 3) pdfkit + wkhtmltopdf (권장 경로)
     if pdfkit is not None:
