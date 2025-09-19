@@ -255,12 +255,12 @@ else:
 # ------------------------------------------------------------------------------
 # (선택) 디버그 도구
 # ------------------------------------------------------------------------------
-with st.expander("🛠 디버그(Cloud 경로/템플릿 확인)"):
-    st.write("CWD:", os.getcwd())
-    try:
-        st.write("프로젝트 루트 파일 목록:", os.listdir("."))
-        st.write("utils 폴더:", os.listdir("utils"))
-        st.write("templates 폴더:", os.listdir("templates") if Path("templates").exists() else "없음")
-        st.write("outputs 폴더:", os.listdir("outputs") if Path("outputs").exists() else "없음")
-    except Exception as e:
-        st.write("디버그 중 오류:", e)
+#with st.expander("🛠 디버그(Cloud 경로/템플릿 확인)"):
+#    st.write("CWD:", os.getcwd())
+ #   try:
+  #      st.write("프로젝트 루트 파일 목록:", os.listdir("."))
+   #     st.write("utils 폴더:", os.listdir("utils"))
+    #    st.write("templates 폴더:", os.listdir("templates") if Path("templates").exists() else "없음")
+    #    st.write("outputs 폴더:", os.listdir("outputs") if Path("outputs").exists() else "없음")
+   # except Exception as e:
+    #    st.write("디버그 중 오류:", e)
