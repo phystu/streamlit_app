@@ -9,7 +9,7 @@ SYSTEM = "You are a Korean note-taking assistant for hospital meetings. Reply ON
 SUMMARY_PROMPT = """
 다음은 병원 회의의 전사본이야. 핵심을 한국어로 간결하게 정리해.
 응답은 JSON으로만 하고, 키는
-- brief: 2-3문장 요약
+- brief: 4-5문장 요약
 - bullets: 5개 내외 핵심 bullet 리스트
 - decisions: 회의에서 결정된 사항 bullet
 - actions: 액션 배열 (각 항목은 {owner, task, due})
