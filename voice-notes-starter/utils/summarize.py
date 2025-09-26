@@ -26,6 +26,7 @@ SUMMARY_PROMPT = """
 규칙(매우 중요):
 - actions[].due 는 반드시 'YYYY-MM-DD' 형식(ISO, Asia/Seoul 기준 가정)으로만 출력. 모르면 null.
 - 상대표현(예: '다음주 금요일', '말일')은 meeting_date를 기준으로 실제 날짜로 변환. meeting_date 없으면 null.
+- 마감일은 meeting_date보다 과거일 수 없음. 과거가 되면 null.
 - 임의 추정/환상 금지. 전사에 근거 없으면 null.
 - actions 항목의 키는 owner, task, due 만 허용.
 - bullets/decisions는 간결한 한국어 문장형 bullet로.
@@ -46,6 +47,7 @@ RESEARCH_ENRICH = """
 규칙(매우 중요):
 - actions[].due 는 반드시 'YYYY-MM-DD' 형식(ISO, Asia/Seoul 기준 가정)으로만 출력. 모르면 null.
 - 상대표현은 meeting_date를 기준으로 실제 날짜로 변환. meeting_date 없으면 null.
+- 마감일은 meeting_date보다 과거일 수 없음. 과거가 되면 null.
 - 임의 추정 금지. 전사/요약에 근거 없으면 null.
 - actions 항목의 키는 owner, task, due 만 허용.
 """
@@ -67,16 +69,13 @@ def _safe_json_loads(s: str) -> dict:
     """
     모델이 실수로 텍스트를 섞었을 때를 대비해 첫 번째 JSON blob만 추출/파싱.
     """
-    # 빠른 경로
     try:
         return json.loads(s)
     except Exception:
         pass
-    # 넓게 { ... } 블록만 추출
     m = re.search(r"\{.*\}", s, flags=re.S)
     if m:
         return json.loads(m.group(0))
-    # 진짜로 JSON이 아니면 원문을 보여주기 쉬운 형태로 예외
     raise json.JSONDecodeError(
         "JSON parsing failed",
         s[:200] + ("..." if len(s) > 200 else ""),
@@ -97,9 +96,58 @@ def _is_valid_iso_date(s: Any) -> bool:
     except ValueError:
         return False
 
-def _normalize_actions(actions: Any) -> List[Dict[str, Any]]:
+def _normalize_meeting_date(meeting_date: Optional[str]) -> Optional[str]:
     """
-    actions 배열을 정규화: 키 제한, 문자열 트림, due ISO 형식만 허용(아니면 None).
+    meeting_date를 다양한 포맷(예: '25년 9월 22일', '2025.9.22', '2025/09/22', '25-09-22')에서
+    ISO 'YYYY-MM-DD'로 정규화. 2자리 연도는 2000+yy로 해석.
+    """
+    if not meeting_date:
+        return None
+
+    s = str(meeting_date).strip()
+
+    # 이미 ISO면 통과
+    if _is_valid_iso_date(s):
+        return s
+
+    # 한국식: '25년 9월 22일' / '2025년 9월 22일'
+    m = re.search(r"^\s*(\d{2,4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일\s*$", s)
+    if m:
+        yy, mm, dd = m.groups()
+        y = int(yy)
+        if y < 100:
+            y += 2000
+        return f"{y:04d}-{int(mm):02d}-{int(dd):02d}"
+
+    # 구분자: '.', '/', '-' 혼합 표기
+    m = re.search(r"^\s*(\d{2,4})[./-](\d{1,2})[./-](\d{1,2})\s*$", s)
+    if m:
+        yy, mm, dd = m.groups()
+        y = int(yy)
+        if y < 100:
+            y += 2000
+        return f"{y:04d}-{int(mm):02d}-{int(dd):02d}"
+
+    # YYMMDD 혹은 YYYYMMDD (붙여쓴 숫자)
+    m = re.search(r"^\s*(\d{6}|\d{8})\s*$", s)
+    if m:
+        raw = m.group(1)
+        if len(raw) == 6:  # YYMMDD
+            y = 2000 + int(raw[0:2])
+            return f"{y:04d}-{int(raw[2:4]):02d}-{int(raw[4:6]):02d}"
+        else:  # YYYYMMDD
+            return f"{int(raw[0:4]):04d}-{int(raw[4:6]):02d}-{int(raw[6:8]):02d}"
+
+    # 실패 시 None
+    return None
+
+def _normalize_actions(actions: Any, meeting_date_dt: Optional[dt.date] = None) -> List[Dict[str, Any]]:
+    """
+    actions 배열을 정규화:
+    - 키 제한(owner, task, due)
+    - 문자열 트림
+    - due ISO 형식만 허용(아니면 None)
+    - meeting_date가 주어지면 과거 날짜 due는 None 처리
     """
     normalized: List[Dict[str, Any]] = []
     if not isinstance(actions, list):
@@ -114,10 +162,18 @@ def _normalize_actions(actions: Any) -> List[Dict[str, Any]]:
         task  = task.strip()
 
         if _is_valid_iso_date(due):
-            due_val: Optional[str] = due
+            try:
+                due_dt = dt.date.fromisoformat(due)
+            except ValueError:
+                due_dt = None
         else:
-            due_val = None
+            due_dt = None
 
+        # 회의일 이전이면 무효화 (모델의 과거 연도 오판 방지)
+        if due_dt and meeting_date_dt and due_dt < meeting_date_dt:
+            due_dt = None
+
+        due_val: Optional[str] = due_dt.isoformat() if due_dt else None
         normalized.append({"owner": owner, "task": task, "due": due_val})
     return normalized
 
@@ -126,7 +182,6 @@ def _apply_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
     data.setdefault("bullets", [])
     data.setdefault("decisions", [])
     data.setdefault("actions", [])
-    # type_hint은 소문자 보정
     th = (data.get("type_hint") or "").strip().lower()
     if th not in ("research", "general"):
         th = "general"
@@ -139,19 +194,29 @@ def _apply_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
 def summarize_transcript(
     transcript: str,
     api_key: Optional[str] = None,
-    meeting_date: Optional[str] = None,  # 'YYYY-MM-DD' (KST 기준) 권장
+    meeting_date: Optional[str] = None,  # 자유 형식 입력 가능. 내부에서 ISO로 정규화.
     model: str = "gpt-4o-mini",
 ) -> Dict[str, Any]:
     """
     전사본 -> 요약(JSON). 연구회의 추정 시 research_enrich 포함.
-    - meeting_date: 상대기한 해석 기준일(선택). 'YYYY-MM-DD'. 없으면 due는 null로 유도.
+    - meeting_date: 상대기한 해석 기준일(선택). 한국식 포함 다양한 포맷 허용, 내부에서 ISO로 정규화.
     - model: 교체 용이하도록 인자로 노출(기본 gpt-4o-mini).
     """
     client = get_client(api_key)
 
+    # meeting_date 정규화 (예: '25년 9월 22일' -> '2025-09-22')
+    meeting_date_iso = _normalize_meeting_date(meeting_date)
+    meeting_date_dt: Optional[dt.date] = None
+    if meeting_date_iso:
+        try:
+            meeting_date_dt = dt.date.fromisoformat(meeting_date_iso)
+        except ValueError:
+            meeting_date_iso = None
+            meeting_date_dt = None
+
     # 프롬프트 주입값 구성
     transcript_snip = transcript[:18000] if transcript else ""
-    mt_line = f"\nmeeting_date: {meeting_date}\n" if meeting_date else "\nmeeting_date: (미지정)\n"
+    mt_line = f"\nmeeting_date: {meeting_date_iso}\n" if meeting_date_iso else "\nmeeting_date: (미지정)\n"
 
     msgs = [
         {"role": "system", "content": SYSTEM},
@@ -171,7 +236,6 @@ def summarize_transcript(
         )
         text = r.choices[0].message.content or "{}"
     except Exception:
-        # 오래된 SDK/모델에서 response_format 미지원일 가능성 폴백
         r = client.chat.completions.create(
             model=model,
             messages=msgs,
@@ -181,7 +245,7 @@ def summarize_transcript(
 
     data = _safe_json_loads(text)
     data = _apply_defaults(data)
-    data["actions"] = _normalize_actions(data.get("actions"))
+    data["actions"] = _normalize_actions(data.get("actions"), meeting_date_dt)
 
     # 2) 연구 보조요약 (연구로 감지된 경우에만)
     if data["type_hint"] == "research":
@@ -190,7 +254,7 @@ def summarize_transcript(
             {
                 "role": "user",
                 "content": (
-                    (f"meeting_date: {meeting_date}\n" if meeting_date else "meeting_date: (미지정)\n")
+                    (f"meeting_date: {meeting_date_iso}\n" if meeting_date_iso else "meeting_date: (미지정)\n")
                     + RESEARCH_ENRICH
                     + "\n\n---\n[요약(JSON)]:\n"
                     + json.dumps(
@@ -227,13 +291,13 @@ def summarize_transcript(
 
         enrich_data = _safe_json_loads(enrich_text)
 
-        # 보조요약 기본값 + 액션 정규화
+        # 보조요약 기본값 + 액션 정규화(회의일 이전 금지 동일 적용)
         enrich_data.setdefault("objective", "")
         enrich_data.setdefault("methods", [])
         enrich_data.setdefault("results", [])
         enrich_data.setdefault("limitations", "")
         enrich_data.setdefault("actions", [])
-        enrich_data["actions"] = _normalize_actions(enrich_data.get("actions"))
+        enrich_data["actions"] = _normalize_actions(enrich_data.get("actions"), meeting_date_dt)
 
         data["research_enrich"] = enrich_data
 
