@@ -102,11 +102,10 @@ def _normalize_meeting_date(value: Optional[str]) -> Optional[str]:
         return None
     s = str(value).strip()
 
-    # 이미 ISO 날짜라면
     if _is_valid_iso_date(s):
         return s
 
-    # 한국식: '2025년 9월 22일' / '25년 9월 22일'
+    # '2025년 9월 22일' / '25년 9월 22일'
     m = re.search(r"^\s*(\d{2,4})\s*년\s*(\d{1,2})\s*월\s*(\d{1,2})\s*일", s)
     if m:
         yy, mm, dd = m.groups()
@@ -115,7 +114,7 @@ def _normalize_meeting_date(value: Optional[str]) -> Optional[str]:
             y += 2000
         return f"{y:04d}-{int(mm):02d}-{int(dd):02d}"
 
-    # 구분자: '.', '/', '-' (시간/요일/괄호는 무시)
+    # '2025.9.22', '2025/09/22', '2025-09-22'
     m = re.search(r"^\s*(\d{2,4})[./-](\d{1,2})[./-](\d{1,2})", s)
     if m:
         yy, mm, dd = m.groups()
@@ -124,29 +123,24 @@ def _normalize_meeting_date(value: Optional[str]) -> Optional[str]:
             y += 2000
         return f"{y:04d}-{int(mm):02d}-{int(dd):02d}"
 
-    # 붙여쓴 숫자: YYMMDD 또는 YYYYMMDD
+    # YYMMDD / YYYYMMDD
     m = re.search(r"^\s*(\d{6}|\d{8})\s*$", s)
     if m:
         raw = m.group(1)
-        if len(raw) == 6:  # YYMMDD
+        if len(raw) == 6:
             y = 2000 + int(raw[0:2])
             return f"{y:04d}-{int(raw[2:4]):02d}-{int(raw[4:6]):02d}"
-        else:  # YYYYMMDD
+        else:
             return f"{int(raw[0:4]):04d}-{int(raw[4:6]):02d}-{int(raw[6:8]):02d}"
 
-    # 시간/요일이 붙은 일반 텍스트에서 날짜만 뽑기
-    # 예) "2025-09-22 12:05", "2025.9.22(월) 12:05", "25년 9월 22일(월) 12:05"
-    m = re.search(
-        r"(?P<y>\d{2,4})[년./-]\s*(?P<m>\d{1,2})[월./-]\s*(?P<d>\d{1,2})",
-        s,
-    )
+    # 일반 텍스트에서 날짜만 추출 (시간/요일 무시)
+    m = re.search(r"(?P<y>\d{2,4})[년./-]\s*(?P<m>\d{1,2})[월./-]\s*(?P<d>\d{1,2})", s)
     if m:
         y = int(m.group("y"))
         if y < 100:
             y += 2000
         return f"{y:04d}-{int(m.group('m')):02d}-{int(m.group('d')):02d}"
 
-    # 실패
     return None
 
 def _extract_meeting_date_from_meta(meta: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -174,15 +168,12 @@ def _extract_meeting_date_from_text(transcript: str) -> Optional[str]:
     if not transcript:
         return None
 
-    # 1) '일시:' 라인 우선 탐색
-    # 예) "**일시:** 2025-09-22 12:05", "일시: 2025.9.22(월) 12:05"
     m = re.search(r"(?:\*\*)?\s*일시\s*(?:\*\*)?\s*:\s*([^\n\r]+)", transcript, flags=re.I)
     if m:
         iso = _normalize_meeting_date(m.group(1))
         if iso:
             return iso
 
-    # 2) 'date:' / '날짜:' / '일자:' 대안 키 탐색
     for key in ("date", "날짜", "일자"):
         m2 = re.search(rf"(?:\*\*)?\s*{key}\s*(?:\*\*)?\s*:\s*([^\n\r]+)", transcript, flags=re.I)
         if m2:
@@ -190,7 +181,6 @@ def _extract_meeting_date_from_text(transcript: str) -> Optional[str]:
             if iso:
                 return iso
 
-    # 3) 본문 첫 20줄에서 날짜 패턴 단독 탐지
     head = "\n".join(transcript.splitlines()[:20])
     guess = _normalize_meeting_date(head)
     return guess
@@ -223,7 +213,6 @@ def _normalize_actions(actions: Any, meeting_date_dt: Optional[dt.date] = None) 
         else:
             due_dt = None
 
-        # 회의일 이전이면 무효화 (모델의 과거 연도 오판 방지)
         if due_dt and meeting_date_dt and due_dt < meeting_date_dt:
             due_dt = None
 
@@ -248,24 +237,24 @@ def _apply_defaults(data: Dict[str, Any]) -> Dict[str, Any]:
 def summarize_transcript(
     transcript: str,
     api_key: Optional[str] = None,
-    # meta는 앱 상단에서 이미 가지고 있는 기본데이터(ex: {"title":..., "dt":"2025-09-22 12:05", ...})
-    meta: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,  # ★ app.py의 기본데이터 전달
     model: str = "gpt-4o-mini",
+    allow_transcript_date_fallback: bool = False,  # ★ 기본은 meta에서만 날짜 사용
 ) -> Dict[str, Any]:
     """
     전사본 -> 요약(JSON). 연구회의 추정 시 research_enrich 포함.
 
-    meeting_date는 아래 우선순위로 자동 추출되어 ISO(YYYY-MM-DD)로 정규화됩니다.
-    1) meta['dt'|'date'|'meeting_date'|'일시'|'날짜'|'일자']
-    2) transcript 헤더의 '일시:' 라인 (또는 'date:'/'날짜:'/'일자:')
-    3) 전사 상단 20줄 내 자유 형식 날짜 추정
-
-    추출 실패 시 meeting_date 미지정으로 처리됩니다.
+    meeting_date는 원칙적으로 app.py의 기본데이터(meta)에서 추출합니다.
+    - meta['dt'|'date'|'meeting_date'|'일시'|'날짜'|'일자'] 중 첫 값을 ISO(YYYY-MM-DD)로 정규화
+    - allow_transcript_date_fallback=True 인 경우에만, meta가 비어 있으면 전사 헤더에서 보조 추출
     """
     client = get_client(api_key)
 
-    # 0) meeting_date 자동 추출
-    meeting_date_iso = _extract_meeting_date_from_meta(meta) or _extract_meeting_date_from_text(transcript)
+    # 0) meeting_date: meta 우선, 기본적으로 transcript fallback 사용 안 함
+    meeting_date_iso = _extract_meeting_date_from_meta(meta)
+    if not meeting_date_iso and allow_transcript_date_fallback:
+        meeting_date_iso = _extract_meeting_date_from_text(transcript)
+
     meeting_date_dt: Optional[dt.date] = None
     if meeting_date_iso:
         try:
